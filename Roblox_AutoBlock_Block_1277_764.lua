@@ -8,6 +8,28 @@ local HttpService        = game:GetService("HttpService")
 local LocalPlayer        = Players.LocalPlayer
 local VirtualInputManager = Instance.new("VirtualInputManager")
 
+local Synchronizer, AnimalsModule, MutationsModule, TraitsModule
+task.spawn(function()
+    local Packages = ReplicatedStorage:WaitForChild("Packages", 10)
+    local Datas = ReplicatedStorage:WaitForChild("Datas", 10)
+    if Packages then
+        pcall(function()
+            Synchronizer = require(Packages:WaitForChild("Synchronizer", 5))
+        end)
+    end
+    if Datas then
+        pcall(function()
+            AnimalsModule = require(Datas:WaitForChild("Animals", 5))
+        end)
+        pcall(function()
+            MutationsModule = require(Datas:WaitForChild("Mutations", 5))
+        end)
+        pcall(function()
+            TraitsModule = require(Datas:WaitForChild("Traits", 5))
+        end)
+    end
+end)
+
 local AutoBlockEnabled       = false
 local AutoFlashEnabled       = false
 local RagdollBypassEnabled   = false
@@ -2347,8 +2369,84 @@ toggleRow("Auto Select Best", "Auto-selects highest $/s brainrot", AutoSelectBes
     pcall(SaveConfig)
 end)
 
-local selectedPrompt = nil
-local selectedSlotNumber = nil
+-- ============================================
+-- BRAINROT SCANNER (EXTRACTED FROM LACASA.LUA)
+-- ============================================
+local yG = {}
+local _cacheHash = {}
+
+local _suffixes = { "", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc" }
+local function formatNumber(num, decimals)
+    decimals = decimals or 1
+    local absNum = math.abs(num)
+    local order = math.max(1, absNum)
+    local exp = math.floor(math.log(order, 1000))
+    local suffix = _suffixes[exp + 1] or ("e+" .. exp)
+    local scaled = num * (10 ^ decimals / 1000 ^ exp)
+    local rounded = math.floor(scaled) / 10 ^ decimals
+    return (("%." .. decimals .. "f"):format(rounded)):gsub("%.?0+$", "") .. suffix
+end
+
+local function calcIncome(animalIndex, mutation, traits)
+    if not AnimalsModule then return 0 end
+    local animalData = AnimalsModule[animalIndex]
+    if not animalData then return 0 end
+    local base = animalData.Generation or animalData.Price * 0.1
+    local multiplier = 1
+    if mutation and mutation ~= "None" and MutationsModule then
+        local mutData = MutationsModule[mutation]
+        if mutData and mutData.Modifier then
+            multiplier = multiplier + mutData.Modifier
+        end
+    end
+    local isSleepy = false
+    if type(traits) == "table" and TraitsModule then
+        for _, trait in ipairs(traits) do
+            if trait == "Sleepy" then
+                isSleepy = true
+            else
+                local traitData = TraitsModule[trait]
+                if traitData and traitData.MultiplierModifier then
+                    multiplier = multiplier + traitData.MultiplierModifier
+                end
+            end
+        end
+    end
+    local income = math.round(base * multiplier)
+    if isSleepy then income = math.round(income * 0.5) end
+    return income
+end
+
+local function getPlotData(plotName)
+    if not Synchronizer then return nil end
+    local ok, result = pcall(function()
+        local oldId = getthreadidentity and getthreadidentity() or nil
+        if setthreadidentity then setthreadidentity(8) end
+        local data = Synchronizer:GetTableFromChannel(plotName)
+        if oldId and setthreadidentity then pcall(setthreadidentity, oldId) end
+        return data
+    end)
+    if ok and type(result) == "table" then return result end
+    return nil
+end
+
+local function isOwnerMe(owner)
+    if not owner then return false end
+    if typeof(owner) == "Instance" then return owner == LocalPlayer end
+    if type(owner) == "string" then return owner == LocalPlayer.Name end
+    return false
+end
+
+local function hashAnimalList(animalList, ownerStr)
+    if not animalList then return "" end
+    local h = ""
+    for k, v in pairs(animalList) do
+        if type(v) == "table" then
+            h = h .. tostring(k) .. tostring(v.Index) .. tostring(v.Mutation)
+        end
+    end
+    return h
+end
 
 local function isMyPlot(plot)
     if not plot then return false end
@@ -2360,51 +2458,122 @@ local function isMyPlot(plot)
     return false
 end
 
-local function isValidStealPrompt(prompt)
-    if not prompt or not prompt.Parent or not prompt.Enabled then return false end
-    local state = prompt:GetAttribute("State")
-    local actionText = prompt.ActionText
-    if state == "Steal" or state == "Grab" or actionText == "Steal" or actionText == "Grab" then return true end
-    return false
+local function getPromptFromSlot(plotName, slotNumber)
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+    local plot = plots:FindFirstChild(plotName)
+    if not plot then return nil end
+    local podiums = plot:FindFirstChild("AnimalPodiums") or plot:FindFirstChild("Podiums")
+    if not podiums then return nil end
+    local targetSlot = tonumber(slotNumber)
+    local targetPodium = nil
+    for _, podium in ipairs(podiums:GetChildren()) do
+        local slotNum = tonumber(podium.Name:match("%d+"))
+        if slotNum == targetSlot or podium.Name == tostring(targetSlot) then
+            targetPodium = podium
+            break
+        end
+    end
+    if not targetPodium then return nil end
+    local base = targetPodium:FindFirstChild("Base") or targetPodium
+    local spawn_ = base:FindFirstChild("Spawn") or base
+    local pa = (spawn_ and spawn_:FindFirstChild("PromptAttachment")) or targetPodium:FindFirstChild("PromptAttachment", true)
+    local prompt = (pa and pa:FindFirstChildWhichIsA("ProximityPrompt")) or targetPodium:FindFirstChildWhichIsA("ProximityPrompt", true)
+    return prompt
 end
 
-local lastRenderedPets = ""
-local function updatePetList()
-    local plotsFolder = workspace:FindFirstChild("Plots")
-    if not plotsFolder then return end
-    local tempPets = {}
-    for _, plot in ipairs(plotsFolder:GetChildren()) do
-        if not isMyPlot(plot) then
-            local podiums = plot:FindFirstChild("AnimalPodiums") or plot:FindFirstChild("Podiums")
-            if podiums then
-                for _, podium in ipairs(podiums:GetChildren()) do
-                    local slotNumber = tonumber(podium.Name:match("%d+")) or 1
-                    local base = podium:FindFirstChild("Base") or podium
-                    local spawnPoint = base:FindFirstChild("Spawn")
-                    local attachment = spawnPoint and spawnPoint:FindFirstChild("PromptAttachment")
-                    if attachment then
-                        for _, child in ipairs(attachment:GetChildren()) do
-                            if child:IsA("ProximityPrompt") and isValidStealPrompt(child) then
-                                local petName = child.ObjectText or "Pet"
-                                table.insert(tempPets, { prompt = child, slot = slotNumber, name = petName, plotName = plot.Name })
-                            end
-                        end
-                    end
+local function scanPlotData(plot)
+    local changed = false
+    pcall(function()
+        local data = getPlotData(plot.Name)
+        if not data then return end
+        local animalList = data.AnimalList
+        local owner = data.Owner
+
+        if not owner or isOwnerMe(owner)
+            or (typeof(owner) == "Instance" and not Players:FindFirstChild(owner.Name))
+            or (type(owner) == "string" and not Players:FindFirstChild(owner)) then
+            _cacheHash[plot.Name] = nil
+            for idx = #yG, 1, -1 do
+                if yG[idx].plot == plot.Name then
+                    table.remove(yG, idx); changed = true
+                end
+            end
+            return
+        end
+
+        if not animalList then
+            _cacheHash[plot.Name] = nil
+            for idx = #yG, 1, -1 do
+                if yG[idx].plot == plot.Name then
+                    table.remove(yG, idx); changed = true
+                end
+            end
+            return
+        end
+
+        local ownerStr = typeof(owner) == "Instance" and owner.Name or tostring(owner)
+        local hash = hashAnimalList(animalList, ownerStr)
+        if _cacheHash[plot.Name] == hash then return end
+
+        for idx = #yG, 1, -1 do
+            if yG[idx].plot == plot.Name then table.remove(yG, idx) end
+        end
+
+        for slotKey, slotData in pairs(animalList) do
+            if type(slotData) == "table" then
+                local animalIndex = slotData.Index
+                local animalInfo = AnimalsModule and AnimalsModule[animalIndex]
+                if animalInfo then
+                    local mut = slotData.Mutation or "None"
+                    if mut == "Yin Yang" then mut = "YinYang" end
+                    local income = calcIncome(animalIndex, slotData.Mutation, slotData.Traits)
+                    local incomeText = "$" .. formatNumber(income) .. "/s"
+                    table.insert(yG, {
+                        name = animalInfo.DisplayName or animalIndex,
+                        genText = incomeText,
+                        genValue = income,
+                        mutation = mut,
+                        traits = slotData.Traits and #slotData.Traits > 0 and table.concat(slotData.Traits, ", ") or "None",
+                        owner = ownerStr,
+                        plot = plot.Name,
+                        slot = tostring(slotKey),
+                        uid = plot.Name .. "_" .. tostring(slotKey),
+                    })
                 end
             end
         end
-    end
-    table.sort(tempPets, function(a, b) return a.slot < b.slot end)
+        _cacheHash[plot.Name] = hash
+        changed = true
+    end)
+    return changed
+end
 
+local function fullScan()
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then return end
+    local anyChanged = false
+    for _, plot in ipairs(plots:GetChildren()) do
+        if not isMyPlot(plot) then
+            if scanPlotData(plot) then anyChanged = true end
+        end
+    end
+    if anyChanged then
+        table.sort(yG, function(a, b) return a.genValue > b.genValue end)
+    end
+end
+
+local lastRenderedHash = ""
+local selectedPetUid = nil
+local function updatePetList()
     local hash = ""
-    for _, p in ipairs(tempPets) do
-        hash = hash .. p.plotName .. tostring(p.slot) .. p.name .. (p.prompt == selectedPrompt and "1" or "0") .. ";"
+    for _, p in ipairs(yG) do
+        hash = hash .. p.uid .. p.name .. (p.uid == selectedPetUid and "1" or "0") .. ";"
     end
-
-    if hash == lastRenderedPets and #scrollListRef:GetChildren() > 1 then
+    if hash == lastRenderedHash and #scrollListRef:GetChildren() > 1 then
         return
     end
-    lastRenderedPets = hash
+    lastRenderedHash = hash
 
     for _, child in ipairs(scrollListRef:GetChildren()) do
         if child:IsA("Frame") then child:Destroy() end
@@ -2418,10 +2587,10 @@ local function updatePetList()
         mute = Color3.fromRGB(130, 130, 140),
     }
 
-    for _, petData in ipairs(tempPets) do
-        local isSelected = (selectedPrompt == petData.prompt)
+    for _, petData in ipairs(yG) do
+        local isSelected = (selectedPetUid == petData.uid)
         local row = Instance.new("Frame")
-        row.Size = UDim2.new(1, -8, 0, 40)
+        row.Size = UDim2.new(1, -8, 0, 44)
         row.BackgroundColor3 = isSelected and Color3.fromRGB(35, 35, 42) or C_list.card
         row.BorderSizePixel = 0
         row.Parent = scrollListRef
@@ -2432,26 +2601,37 @@ local function updatePetList()
         rStroke.Parent = row
 
         local nameLabel = Instance.new("TextLabel")
-        nameLabel.Text = petData.name
-        nameLabel.Size = UDim2.new(1, -60, 1, 0)
-        nameLabel.Position = UDim2.new(0, 10, 0, -4)
+        nameLabel.Text = petData.name .. " (" .. petData.mutation .. ")"
+        nameLabel.Size = UDim2.new(1, -120, 0, 22)
+        nameLabel.Position = UDim2.new(0, 10, 0, 2)
         nameLabel.BackgroundTransparency = 1
         nameLabel.TextColor3 = C_list.bright
         nameLabel.Font = Enum.Font.GothamMedium
-        nameLabel.TextSize = 13
+        nameLabel.TextSize = 12
         nameLabel.TextXAlignment = Enum.TextXAlignment.Left
         nameLabel.Parent = row
 
-        local slotLabel = Instance.new("TextLabel")
-        slotLabel.Text = "slot " .. petData.slot
-        slotLabel.Size = UDim2.new(1, -12, 1, 0)
-        slotLabel.Position = UDim2.new(0, 0, 0, 6)
-        slotLabel.BackgroundTransparency = 1
-        slotLabel.TextColor3 = C_list.mute
-        slotLabel.Font = Enum.Font.GothamMedium
-        slotLabel.TextSize = 11
-        slotLabel.TextXAlignment = Enum.TextXAlignment.Right
-        slotLabel.Parent = row
+        local infoLabel = Instance.new("TextLabel")
+        infoLabel.Text = petData.owner .. " | slot " .. petData.slot
+        infoLabel.Size = UDim2.new(1, -120, 0, 16)
+        infoLabel.Position = UDim2.new(0, 10, 0, 22)
+        infoLabel.BackgroundTransparency = 1
+        infoLabel.TextColor3 = C_list.mute
+        infoLabel.Font = Enum.Font.Gotham
+        infoLabel.TextSize = 10
+        infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+        infoLabel.Parent = row
+
+        local valLabel = Instance.new("TextLabel")
+        valLabel.Text = petData.genText
+        valLabel.Size = UDim2.new(0, 100, 1, 0)
+        valLabel.Position = UDim2.new(1, -110, 0, 0)
+        valLabel.BackgroundTransparency = 1
+        valLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
+        valLabel.Font = Enum.Font.GothamBold
+        valLabel.TextSize = 12
+        valLabel.TextXAlignment = Enum.TextXAlignment.Right
+        valLabel.Parent = row
 
         local clickBtn = Instance.new("TextButton")
         clickBtn.Size = UDim2.new(1, 0, 1, 0)
@@ -2461,72 +2641,100 @@ local function updatePetList()
         clickBtn.Parent = row
 
         clickBtn.MouseButton1Click:Connect(function()
-            selectedPrompt = petData.prompt
-            selectedSlotNumber = petData.slot
+            selectedPetUid = petData.uid
+            local prompt = getPromptFromSlot(petData.plot, petData.slot)
             _G._FH_SelectedBrainrot = {
-                plotName = petData.plotName,
+                plotName = petData.plot,
                 slot = tostring(petData.slot),
                 name = petData.name,
-                prompt = petData.prompt,
+                prompt = prompt,
             }
             updatePetList()
         end)
     end
 
-    if #tempPets == 0 then
+    if #yG == 0 then
         local emptyCard = Instance.new("Frame")
         emptyCard.Name = "EmptyCard"
-        emptyCard.Size = UDim2.new(1, -8, 0, 120)
+        emptyCard.Size = UDim2.new(1, -8, 0, 100)
         emptyCard.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
         emptyCard.BorderSizePixel = 0
-        emptyCard.ZIndex = 4
         emptyCard.Parent = scrollListRef
         Instance.new("UICorner", emptyCard).CornerRadius = UDim.new(0, 10)
         local es = Instance.new("UIStroke"); es.Color = Color3.fromRGB(45, 45, 55); es.Parent = emptyCard
 
-        local iconCircle = Instance.new("Frame")
-        iconCircle.Size = UDim2.new(0, 40, 0, 40)
-        iconCircle.Position = UDim2.new(0.5, -20, 0, 18)
-        iconCircle.BackgroundColor3 = Color3.fromRGB(28, 28, 35)
-        iconCircle.BorderSizePixel = 0
-        iconCircle.ZIndex = 5
-        iconCircle.Parent = emptyCard
-        Instance.new("UICorner", iconCircle).CornerRadius = UDim.new(0, 20)
-        local is = Instance.new("UIStroke"); is.Color = Color3.fromRGB(45, 45, 55); is.Parent = iconCircle
-
-        local iconLabel = Instance.new("TextLabel")
-        iconLabel.Size = UDim2.new(1, 0, 1, 0)
-        iconLabel.BackgroundTransparency = 1
-        iconLabel.ZIndex = 6
-        iconLabel.Text = "!"
-        iconLabel.TextColor3 = Color3.fromRGB(100, 100, 110)
-        iconLabel.TextSize = 18
-        iconLabel.Font = Enum.Font.GothamBold
-        iconLabel.Parent = iconCircle
-
         local titleLabel = Instance.new("TextLabel")
-        titleLabel.Size = UDim2.new(1, -16, 0, 22)
-        titleLabel.Position = UDim2.new(0, 8, 0, 64)
+        titleLabel.Size = UDim2.new(1, -16, 1, 0)
         titleLabel.BackgroundTransparency = 1
-        titleLabel.ZIndex = 5
-        titleLabel.Text = "No brainrots found"
-        titleLabel.TextColor3 = Color3.fromRGB(220, 220, 230)
-        titleLabel.TextSize = 13
+        titleLabel.Text = "Scanning plots for pets..."
+        titleLabel.TextColor3 = Color3.fromRGB(130, 130, 140)
+        titleLabel.TextSize = 12
         titleLabel.Font = Enum.Font.GothamMedium
         titleLabel.Parent = emptyCard
-
-        local subLabel = Instance.new("TextLabel")
-        subLabel.Size = UDim2.new(1, -16, 0, 18)
-        subLabel.Position = UDim2.new(0, 8, 0, 86)
-        subLabel.BackgroundTransparency = 1
-        subLabel.ZIndex = 5
-        subLabel.Text = "No brainrots to detect for now"
-        subLabel.TextColor3 = Color3.fromRGB(130, 130, 140)
-        subLabel.TextSize = 11
-        subLabel.Font = Enum.Font.Gotham
-        subLabel.Parent = emptyCard
     end
 end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if AutoSelectBestBrainrot and #yG > 0 then
+            local best = yG[1]
+            if not selectedPetUid or selectedPetUid ~= best.uid then
+                selectedPetUid = best.uid
+                local prompt = getPromptFromSlot(best.plot, best.slot)
+                _G._FH_SelectedBrainrot = {
+                    plotName = best.plot,
+                    slot = tostring(best.slot),
+                    name = best.name,
+                    prompt = prompt,
+                }
+                pcall(updatePetList)
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while not (Synchronizer and AnimalsModule) do
+        task.wait(0.2)
+    end
+    task.wait(0.5)
+    fullScan()
+    pcall(updatePetList)
+    
+    local plots = workspace:WaitForChild("Plots", 10)
+    if plots then
+        for _, plot in ipairs(plots:GetChildren()) do
+            if not isMyPlot(plot) then
+                local pods = plot:FindFirstChild("AnimalPodiums") or plot:FindFirstChild("Podiums")
+                if pods then
+                    pods.ChildAdded:Connect(function() task.wait(0.1); scanPlotData(plot); pcall(updatePetList) end)
+                    pods.ChildRemoved:Connect(function()
+                        for idx = #yG, 1, -1 do
+                            if yG[idx].plot == plot.Name then table.remove(yG, idx) end
+                        end
+                        _cacheHash[plot.Name] = nil
+                        task.wait(0.1)
+                        scanPlotData(plot)
+                        pcall(updatePetList)
+                    end)
+                end
+            end
+        end
+        plots.ChildAdded:Connect(function(plot)
+            task.wait(0.5)
+            if not isMyPlot(plot) then
+                scanPlotData(plot)
+                pcall(updatePetList)
+            end
+        end)
+    end
+    while true do
+        task.wait(1)
+        fullScan()
+        pcall(updatePetList)
+    end
+end)
 
 task.spawn(function()
     local base1 = UIGradient.Rotation
@@ -2736,14 +2944,7 @@ UserInputService.InputBegan:Connect(function(inp, gpe)
     end
 end)
 
-task.spawn(function()
-    while true do
-        if winVisible then
-            pcall(updatePetList)
-        end
-        task.wait(2.5)
-    end
-end)
+-- Background pet list update loop removed
 
 local lastViewportSize = workspace.CurrentCamera.ViewportSize
 workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
