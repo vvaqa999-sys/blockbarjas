@@ -35,6 +35,7 @@ local AutoFlashEnabled       = false
 local RagdollBypassEnabled   = false
 local ApEspEnabled           = false
 local AutoSelectBestBrainrot = false
+local BypassAutoDefense      = false
 local BlockSpeed             = "ULTRA"
 local AntiRagdoll = { connections = {}, running = false }
 
@@ -64,6 +65,7 @@ local function SaveConfig()
 			AntiRagdollEnabled = (AntiRagdoll and AntiRagdoll.running) or false,
 			ApEspEnabled = ApEspEnabled,
 			AutoSelectBestBrainrot = AutoSelectBestBrainrot,
+			BypassAutoDefense = BypassAutoDefense,
 			BlockSpeed = BlockSpeed or "ULTRA",
 			Hotkeys = hotkeysSaved
 		}
@@ -83,6 +85,7 @@ local function LoadConfig()
 		if data.RagdollBypassEnabled ~= nil then RagdollBypassEnabled = data.RagdollBypassEnabled end
 		if data.ApEspEnabled ~= nil then ApEspEnabled = data.ApEspEnabled end
 		if data.AutoSelectBestBrainrot ~= nil then AutoSelectBestBrainrot = data.AutoSelectBestBrainrot end
+		if data.BypassAutoDefense ~= nil then BypassAutoDefense = data.BypassAutoDefense end
 		if data.BlockSpeed ~= nil then BlockSpeed = data.BlockSpeed end
 		if data.Hotkeys and type(data.Hotkeys) == "table" and ActionHotkeys then
 			for k, keyName in pairs(data.Hotkeys) do
@@ -924,52 +927,60 @@ local function doFlash()
 		},
 	}
 
-	local myBase = nil
-	local plotsFolder = workspace:FindFirstChild("Plots")
-	if plotsFolder then
-		for _, plot in ipairs(plotsFolder:GetChildren()) do
-			if plot:IsA("Model") then
-				local sign = plot:FindFirstChild("PlotSign")
-				if sign and sign:FindFirstChild("YourBase") and sign.YourBase.Enabled then
-					local ok, order = pcall(function() return plot:GetAttribute("Order") end)
-					if ok and order then myBase = tonumber(order) end
-					break
+		local myBase = nil
+		local plotsFolder = workspace:FindFirstChild("Plots")
+		if plotsFolder then
+			for _, plot in ipairs(plotsFolder:GetChildren()) do
+				if plot:IsA("Model") then
+					local sign = plot:FindFirstChild("PlotSign")
+					if sign and sign:FindFirstChild("YourBase") and sign.YourBase.Enabled then
+						local ok, order = pcall(function() return plot:GetAttribute("Order") end)
+						if ok and order then myBase = tonumber(order) end
+						break
+					end
 				end
 			end
 		end
-	end
 
-	if not myBase then
-		pcall(ShowToggleNotification, "Flash: base not detected", false)
-		return
-	end
+		if not myBase then
+			pcall(ShowToggleNotification, "Flash: base not detected", false)
+			return
+		end
 
-	local targetBase = (myBase == 1) and 2 or 1
-	local podiumCFs = PODIUM_CFRAMES[targetBase]
-	if not podiumCFs then return end
+		local targetBase = (myBase == 1) and 2 or 1
+		local podiumCFs = PODIUM_CFRAMES[targetBase]
+		if not podiumCFs then return end
 
-	local selected = _G._FH_SelectedBrainrot
-	if not selected then
-		pcall(ShowToggleNotification, "Flash: select an animal first", false)
-		return
-	end
+		local selected = _G._FH_SelectedBrainrot
+		if not selected then
+			pcall(ShowToggleNotification, "Flash: select an animal first", false)
+			return
+		end
 
-	local slot = tonumber(selected.slot)
-	if not slot then
-		pcall(ShowToggleNotification, "Flash: selected animal has no slot", false)
-		return
-	end
+		local slot = tonumber(selected.slot)
+		if not slot then
+			pcall(ShowToggleNotification, "Flash: selected animal has no slot", false)
+			return
+		end
 
-	local entry = podiumCFs[slot]
-	if not entry or not entry.cam then
-		pcall(ShowToggleNotification, "Flash: podium " .. tostring(slot) .. " not configured yet", false)
-		return
-	end
+		local entry = podiumCFs[slot]
+		if not entry or not entry.cam then
+			pcall(ShowToggleNotification, "Flash: podium " .. tostring(slot) .. " not configured yet", false)
+			return
+		end
 
-	task.spawn(function()
-		local currentSpeed = entry.hrpFloat and 800 or 180
-		local ARRIVE_DIST  = 4
-		local TIMEOUT      = 8
+		if BypassAutoDefense then
+			-- Block/Protect for 0.5s right before triggering Flash TP to bypass auto block defense
+			task.spawn(function()
+				pcall(doBlock)
+			end)
+			task.wait(0.5)
+		end
+
+		task.spawn(function()
+			local currentSpeed = entry.hrpFloat and 800 or 180
+			local ARRIVE_DIST  = 4
+			local TIMEOUT      = 8
 
 		local player    = LocalPlayer
 		local targetPos = (entry.hrpWalk and entry.hrpWalk.Position) or entry.hrp.Position
@@ -2196,6 +2207,10 @@ toggleRow("Auto Flash", "Auto flash teleport on enemies", AutoFlashEnabled, func
 end)
 toggleRow("Ragdoll Bypass", "Bypasses ragdoll effects on character", RagdollBypassEnabled, function(v)
     RagdollBypassEnabled = v
+    pcall(SaveConfig)
+end)
+toggleRow("Bypass Auto Defense", "Blocks 0.5s before flashing to bypass auto blocks", BypassAutoDefense, function(v)
+    BypassAutoDefense = v
     pcall(SaveConfig)
 end)
 toggleRow("Anti Ragdoll", "Prevents ragdoll from triggering", (AntiRagdoll and AntiRagdoll.running) or false, function(v)
